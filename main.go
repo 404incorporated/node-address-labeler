@@ -7,9 +7,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -40,13 +42,7 @@ func main() {
 
 	client := makeKubeClient()
 
-	node := getNode(client, nodeName)
-
-	removeAllAddrLabels(node)
-
-	setInitialAddrLabels(iface, node)
-
-	updateNode(client, node)
+	initalAddrs(iface, nodeName, client)
 
 	addrUpdateChan := make(chan netlink.AddrUpdate)
 
@@ -69,27 +65,29 @@ func main() {
 
 }
 
-func setInitialAddrLabels(iface netlink.Link, node *v1.Node) {
-
-	addrs, err := netlink.AddrList(iface, netlink.FAMILY_V4)
-	if err != nil {
-		fmt.Println("error getting addresses")
-	}
-
-	for _, addr := range addrs {
-		key := generateLabelKey(convertAddrToString(addr.IP))
-		fmt.Println("adding label", key, "to node", node.Name)
-		node.Labels[key] = "present"
-	}
-
-}
-
-func removeAllAddrLabels(node *v1.Node) {
-	for key := range node.Labels {
-		if strings.Contains(key, "node.ip/") {
-			fmt.Println("removing label", key, "from node", node.Name)
-			delete(node.Labels, key)
+// removes all node.ip labels and adds current ones, then pushes the changes
+func initalAddrs(iface netlink.Link, nodeName string, client *kubernetes.Clientset) {
+	err := nodeUpdate(client, nodeName, func(node *v1.Node) {
+		for key := range node.Labels {
+			if strings.Contains(key, "node.ip/") {
+				fmt.Println("removing label", key, "from node", node.Name)
+				delete(node.Labels, key)
+			}
 		}
+
+		addrs, err := netlink.AddrList(iface, netlink.FAMILY_V4)
+		if err != nil {
+			fmt.Println("error getting addresses")
+		}
+
+		for _, addr := range addrs {
+			key := generateLabelKey(addr.IP)
+			fmt.Println("adding label", key, "to node", node.Name)
+			node.Labels[key] = "present"
+		}
+	})
+	if err != nil {
+		fmt.Println(err)
 	}
 }
 
@@ -101,14 +99,15 @@ func convertAddrToString(addr net.IP) string {
 	return strings.ReplaceAll(addr.String(), ".", "-")
 }
 
-func generateLabelKey(addr string) string {
-	return "node.ip/" + addr
+func generateLabelKey(addr net.IP) string {
+	return "node.ip/" + convertAddrToString(addr)
 }
 
-func getNode(client *kubernetes.Clientset, nodeName string) *v1.Node {
-	node, err := client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+func getNode(ctx context.Context, client *kubernetes.Clientset, nodeName string) *v1.Node {
+	node, err := client.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
 	if err != nil {
-		fmt.Println("could not get node", nodeName)
+		fmt.Println("failed to get node", nodeName)
+		fmt.Println(err)
 		os.Exit(1)
 	}
 
@@ -116,28 +115,52 @@ func getNode(client *kubernetes.Clientset, nodeName string) *v1.Node {
 }
 
 func addAddrLabel(addr net.IP, client *kubernetes.Clientset, nodeName string) {
-	node := getNode(client, nodeName)
-	key := generateLabelKey(convertAddrToString(addr))
-	node.Labels[key] = "present"
-	fmt.Println("adding label", key, "to node", node.Name)
-	updateNode(client, node)
+	err := nodeUpdate(client, nodeName, func(node *v1.Node) {
+		key := generateLabelKey(addr)
+		node.Labels[key] = "present"
+		fmt.Println("adding label", key, "to node", node.Name)
+	})
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
 func removeAddrLabel(addr net.IP, client *kubernetes.Clientset, nodeName string) {
-	node := getNode(client, nodeName)
-	key := generateLabelKey(convertAddrToString(addr))
-	delete(node.Labels, key)
-	fmt.Println("removing label", key, "from node", node.Name)
-	updateNode(client, node)
+	err := nodeUpdate(client, nodeName, func(node *v1.Node) {
+		key := generateLabelKey(addr)
+		delete(node.Labels, key)
+		fmt.Println("removing label", key, "from node", node.Name)
+	})
+	if err != nil {
+		fmt.Println(err)
+	}
 }
 
-func updateNode(client *kubernetes.Clientset, node *v1.Node) {
-	_, err := client.CoreV1().Nodes().Update(context.TODO(), node, metav1.UpdateOptions{})
-	if err != nil {
-		fmt.Println("error pushing node changes", err)
-	} else {
-		fmt.Println("changes saved")
+// Run arbitrary function on v1.Node to apply changes. Retries where there are errors.
+func nodeUpdate(client *kubernetes.Clientset, nodeName string, updateFunc func(node *v1.Node)) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for {
+		node := getNode(ctx, client, nodeName)
+
+		updateFunc(node)
+
+		_, err := client.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+		if err == nil {
+			fmt.Println("updated node successfully")
+			return nil
+		}
+
+		if errors.IsConflict(err) {
+			fmt.Println("version mismatch, trying again")
+			continue
+		}
+
+		return fmt.Errorf("failed to update node: %v", err)
+
 	}
+
 }
 
 func makeKubeClient() *kubernetes.Clientset {
